@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <SD.h>
 #include <ACAN2517FD.h>
 #include <ESP8266WiFi.h>  
 #include <WiFiUdp.h>
@@ -17,10 +18,120 @@ char packetBuffer[255]; // Puffer a bejovo Wi-Fi adatoknak
 // --- CAN FD settings  ---
 ACAN2517FD can(CAN_CS_PIN, SPI, CAN_INT_PIN);
 
+// --- Runtime allapotok ---
+bool udpEnabled = false;     // Indulaskor OFF
+bool sdReady = false;
+uint32_t sdWriteErrors = 0;
+
+const char* canLogFilePath = "/can_log.csv";
+const uint32_t logFlushIntervalMs = 1000;
+uint32_t lastLogFlushMs = 0;
+
+// ADC gomb: elengedve ~0V, nyomva ~0.8V
+const uint16_t adcPressThreshold = 700;
+const uint16_t adcReleaseThreshold = 250;
+const uint32_t buttonDebounceMs = 40;
+
+bool buttonRawPressed = false;
+bool buttonStablePressed = false;
+uint32_t buttonLastChangeMs = 0;
+
+File logFile;
+
+void formatDataHex(const CANFDMessage& frame, char* outBuffer, size_t outSize) {
+    size_t idx = 0;
+    for (uint8_t i = 0; i < frame.len && idx + 3 < outSize; i++) {
+        idx += snprintf(&outBuffer[idx], outSize - idx, "%02X", frame.data[i]);
+        if (i + 1 < frame.len && idx + 2 < outSize) {
+            outBuffer[idx++] = ' ';
+            outBuffer[idx] = '\0';
+        }
+    }
+}
+
+bool initSdLogging() {
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("SD init hiba, log letiltva.");
+        return false;
+    }
+
+    logFile = SD.open(canLogFilePath, FILE_WRITE);
+    if (!logFile) {
+        Serial.println("SD logfajl nyitasi hiba, log letiltva.");
+        return false;
+    }
+
+    if (logFile.size() == 0) {
+        logFile.println("timestamp_ms,direction,id,len,data");
+    }
+    logFile.flush();
+    lastLogFlushMs = millis();
+
+    Serial.println("SD logolas aktiv.");
+    return true;
+}
+
+void flushLogIfDue() {
+    if (sdReady && logFile && (millis() - lastLogFlushMs >= logFlushIntervalMs)) {
+        logFile.flush();
+        lastLogFlushMs = millis();
+    }
+}
+
+void logCanEvent(const CANFDMessage& frame, const char* direction) {
+    if (!sdReady || !logFile) {
+        return;
+    }
+
+    char dataHex[3 * 64 + 1] = {0};
+    formatDataHex(frame, dataHex, sizeof(dataHex));
+
+    char line[512] = {0};
+    snprintf(line, sizeof(line), "%lu,%s,0x%lX,%u,%s",
+             millis(), direction, static_cast<unsigned long>(frame.id), frame.len, dataHex);
+
+    if (logFile.println(line) == 0) {
+        sdWriteErrors++;
+        if (sdWriteErrors <= 5 || (sdWriteErrors % 50 == 0)) {
+            Serial.printf("SD log irasi hiba (db: %lu)\n", static_cast<unsigned long>(sdWriteErrors));
+        }
+    }
+}
+
+void updateUdpToggleButton() {
+    const uint16_t adcValue = analogRead(ADC_BUTTON_PIN);
+
+    bool newRawPressed = buttonRawPressed;
+    if (buttonRawPressed) {
+        if (adcValue <= adcReleaseThreshold) {
+            newRawPressed = false;
+        }
+    } else {
+        if (adcValue >= adcPressThreshold) {
+            newRawPressed = true;
+        }
+    }
+
+    if (newRawPressed != buttonRawPressed) {
+        buttonRawPressed = newRawPressed;
+        buttonLastChangeMs = millis();
+    }
+
+    if ((millis() - buttonLastChangeMs >= buttonDebounceMs) && (buttonStablePressed != buttonRawPressed)) {
+        buttonStablePressed = buttonRawPressed;
+
+        if (buttonStablePressed) {
+            udpEnabled = !udpEnabled;
+            Serial.printf("UDP adatkuldes: %s\n", udpEnabled ? "ON" : "OFF");
+        }
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n--- CAN FD Debug Tool Indulása ---");
+    Serial.println("UDP alapallapot: OFF");
 
     // 1. Wi-Fi 
     WiFi.begin(ssid, password);
@@ -39,6 +150,9 @@ void setup() {
     // 3. CAN FD initialize
     SPI.begin();
     SPI.pins(CAN_SCK_PIN, CAN_MISO_PIN, CAN_MOSI_PIN, CAN_CS_PIN);
+
+    // 4. SD initialize (mindig logolni probalunk)
+    sdReady = initSdLogging();
     
     ACAN2517FDSettings settings(ACAN2517FDSettings::OSC_40MHz, 500UL * 1000UL, DataBitRateFactor::x4);
     const uint32_t errorCode = can.begin(settings, [] { can.isr(); });
@@ -65,17 +179,23 @@ void loop() {
     CANFDMessage frame;
     String outputMsg = "";
 
+    updateUdpToggleButton();
+    flushLogIfDue();
+
     // CAN read
     if (can.receive(frame)) {
         outputMsg = formatCanMessage(frame);
+        logCanEvent(frame, "RX");
         
         // USB-n (Virtuális soros port)
         Serial.println(outputMsg);
         
         // Wi-Fi-n (UDP)
-        udp.beginPacket(pcIP, udpPort);
-        udp.print(outputMsg);
-        udp.endPacket();
+        if (udpEnabled) {
+            udp.beginPacket(pcIP, udpPort);
+            udp.print(outputMsg);
+            udp.endPacket();
+        }
     }
 
     // CAN send USB-n
@@ -91,6 +211,7 @@ void loop() {
             
             if (can.tryToSend(txFrame)) {
                 Serial.println("Teszt üzenet injektálva USB parancsra!");
+                logCanEvent(txFrame, "TX");
             }
         }
     }
@@ -98,20 +219,32 @@ void loop() {
     // CAN send Wi-Fi-n
     int packetSize = udp.parsePacket();
     if (packetSize) {
-        int len = udp.read(packetBuffer, 255);
-        if (len > 0) packetBuffer[len] = '\0'; 
-        
-        String command = String(packetBuffer);
-        command.trim();
+        if (udpEnabled) {
+            int len = udp.read(packetBuffer, sizeof(packetBuffer) - 1);
+            if (len > 0) {
+                packetBuffer[len] = '\0';
+            } else {
+                packetBuffer[0] = '\0';
+            }
 
-        if (command == "SEND_TEST") {
-            CANFDMessage txFrame;
-            txFrame.id = 0x200; 
-            txFrame.len = 8;
-            for(int i=0; i<8; i++) txFrame.data[i] = 0xFF;
-            
-            if (can.tryToSend(txFrame)) {
-                Serial.println("Teszt üzenet injektálva Wi-Fi parancsra!");
+            String command = String(packetBuffer);
+            command.trim();
+
+            if (command == "SEND_TEST") {
+                CANFDMessage txFrame;
+                txFrame.id = 0x200;
+                txFrame.len = 8;
+                for (int i = 0; i < 8; i++) txFrame.data[i] = 0xFF;
+
+                if (can.tryToSend(txFrame)) {
+                    Serial.println("Teszt üzenet injektálva Wi-Fi parancsra!");
+                    logCanEvent(txFrame, "TX");
+                }
+            }
+        } else {
+            // UDP kikapcsolt allapotban a csomagokat eldobjuk.
+            while (udp.available()) {
+                udp.read(packetBuffer, sizeof(packetBuffer));
             }
         }
     }
