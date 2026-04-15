@@ -21,11 +21,25 @@ ACAN2517FD can(CAN_CS_PIN, SPI, CAN_INT_PIN);
 // --- Runtime allapotok ---
 bool udpEnabled = false;     // Indulaskor OFF
 bool sdReady = false;
+bool canReady = false;
+bool canBusError = false;
 uint32_t sdWriteErrors = 0;
+uint16_t canTxFailStreak = 0;
 
 const char* canLogFilePath = "/can_log.csv";
 const uint32_t logFlushIntervalMs = 1000;
 uint32_t lastLogFlushMs = 0;
+
+const uint32_t rxLedFlashMs = 80;
+uint32_t rxLedFlashUntilMs = 0;
+
+const uint16_t canTxFailErrorThreshold = 20;
+const uint32_t canReinitIntervalMs = 2000;
+uint32_t lastCanInitAttemptMs = 0;
+
+// A kapcsolas szerint LED_A aktiv alacsony, LED_B aktiv magas.
+const bool ledAActiveLow = true;
+const bool ledBActiveLow = false;
 
 // ADC gomb: elengedve ~0V, nyomva ~0.8V
 const uint16_t adcPressThreshold = 700;
@@ -37,6 +51,80 @@ bool buttonStablePressed = false;
 uint32_t buttonLastChangeMs = 0;
 
 File logFile;
+
+void setLed(uint8_t pin, bool on, bool activeLow) {
+    digitalWrite(pin, (on ^ activeLow) ? HIGH : LOW);
+}
+
+void updateStatusLeds() {
+    if (canBusError) {
+        setLed(LED_A, true, ledAActiveLow);
+        setLed(LED_B, true, ledBActiveLow);
+        return;
+    }
+
+    const bool rxBlinkActive = millis() < rxLedFlashUntilMs;
+    setLed(LED_A, rxBlinkActive, ledAActiveLow);
+    setLed(LED_B, udpEnabled, ledBActiveLow);
+}
+
+void noteCanTxResult(bool success) {
+    if (success) {
+        canTxFailStreak = 0;
+        return;
+    }
+
+    if (canTxFailStreak < 0xFFFF) {
+        canTxFailStreak++;
+    }
+
+    if (canTxFailStreak >= canTxFailErrorThreshold) {
+        if (!canBusError) {
+            Serial.println("CAN hiba allapot: tul sok sikertelen TX kiserlet.");
+        }
+        canBusError = true;
+    }
+}
+
+void markCanHealthyTraffic() {
+    canTxFailStreak = 0;
+    if (canBusError) {
+        canBusError = false;
+        Serial.println("CAN hiba visszavonva, normal uzem folytatodik.");
+    }
+}
+
+void tryInitializeCan(bool forceAttempt) {
+    if (!forceAttempt && (millis() - lastCanInitAttemptMs < canReinitIntervalMs)) {
+        return;
+    }
+
+    lastCanInitAttemptMs = millis();
+
+    ACAN2517FDSettings settings(ACAN2517FDSettings::OSC_40MHz, 500UL * 1000UL, DataBitRateFactor::x4);
+    const uint32_t errorCode = can.begin(settings, [] { can.isr(); });
+
+    if (errorCode == 0) {
+        const bool recovered = !canReady;
+        canReady = true;
+        canBusError = false;
+        canTxFailStreak = 0;
+        if (recovered) {
+            Serial.println("CAN FD ujrainicializalas sikeres.");
+        } else if (forceAttempt) {
+            Serial.println("CAN FD sikeresen inicializalva.");
+        }
+    } else {
+        canReady = false;
+        canBusError = true;
+        if (forceAttempt) {
+            Serial.printf("Hiba a CAN indulaskor: 0x%X\n", errorCode);
+            Serial.println("CAN hibaban indul, automatikus ujraprobalas aktiv.");
+        } else {
+            Serial.printf("CAN ujrainicializalas sikertelen: 0x%X\n", errorCode);
+        }
+    }
+}
 
 void formatDataHex(const CANFDMessage& frame, char* outBuffer, size_t outSize) {
     size_t idx = 0;
@@ -133,6 +221,11 @@ void setup() {
     Serial.println("\n--- CAN FD Debug Tool Indulása ---");
     Serial.println("UDP alapallapot: OFF");
 
+    pinMode(LED_A, OUTPUT);
+    pinMode(LED_B, OUTPUT);
+    setLed(LED_A, false, ledAActiveLow);
+    setLed(LED_B, false, ledBActiveLow);
+
     // 1. Wi-Fi 
     WiFi.begin(ssid, password);
     Serial.print("Csatlakozás a Wi-Fi hálózathoz...");
@@ -154,15 +247,9 @@ void setup() {
     // 4. SD initialize (mindig logolni probalunk)
     sdReady = initSdLogging();
     
-    ACAN2517FDSettings settings(ACAN2517FDSettings::OSC_40MHz, 500UL * 1000UL, DataBitRateFactor::x4);
-    const uint32_t errorCode = can.begin(settings, [] { can.isr(); });
+    tryInitializeCan(true);
 
-    if (errorCode == 0) {
-        Serial.println("CAN FD sikeresen inicializálva!");
-    } else {
-        Serial.printf("Hiba a CAN induláskor: 0x%X\n", errorCode);
-        while (1) yield();
-    }
+    updateStatusLeds();
 }
 
 // CAN message formatting
@@ -182,10 +269,18 @@ void loop() {
     updateUdpToggleButton();
     flushLogIfDue();
 
+    if (!canReady) {
+        tryInitializeCan(false);
+    }
+
+    updateStatusLeds();
+
     // CAN read
-    if (can.receive(frame)) {
+    if (canReady && can.receive(frame)) {
         outputMsg = formatCanMessage(frame);
         logCanEvent(frame, "RX");
+        rxLedFlashUntilMs = millis() + rxLedFlashMs;
+        markCanHealthyTraffic();
         
         // USB-n (Virtuális soros port)
         Serial.println(outputMsg);
@@ -208,10 +303,15 @@ void loop() {
             txFrame.id = 0x100;
             txFrame.len = 8;
             for(int i=0; i<8; i++) txFrame.data[i] = i;
-            
-            if (can.tryToSend(txFrame)) {
+
+            const bool txOk = canReady && can.tryToSend(txFrame);
+            noteCanTxResult(txOk);
+            if (txOk) {
+                markCanHealthyTraffic();
                 Serial.println("Teszt üzenet injektálva USB parancsra!");
                 logCanEvent(txFrame, "TX");
+            } else {
+                Serial.println("CAN TX hiba USB parancsnal.");
             }
         }
     }
@@ -236,9 +336,14 @@ void loop() {
                 txFrame.len = 8;
                 for (int i = 0; i < 8; i++) txFrame.data[i] = 0xFF;
 
-                if (can.tryToSend(txFrame)) {
+                const bool txOk = canReady && can.tryToSend(txFrame);
+                noteCanTxResult(txOk);
+                if (txOk) {
+                    markCanHealthyTraffic();
                     Serial.println("Teszt üzenet injektálva Wi-Fi parancsra!");
                     logCanEvent(txFrame, "TX");
+                } else {
+                    Serial.println("CAN TX hiba Wi-Fi parancsnal.");
                 }
             }
         } else {
