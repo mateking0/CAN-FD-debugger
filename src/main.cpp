@@ -263,6 +263,7 @@ String formatCanMessage(const CANFDMessage& frame) {
 }
 
 void loop() {
+    
     CANFDMessage frame;
     String outputMsg = "";
 
